@@ -1,9 +1,10 @@
 import os
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 from datetime import datetime
 from dataclasses import dataclass, asdict
 import json
+import re
 
 try:
     from langfuse import Langfuse
@@ -50,17 +51,40 @@ class PromptRegistry:
             self.langfuse = None
             logger.info("Langfuse integration disabled for PromptRegistry")
         self.prompt_versions: Dict[str, PromptVersion] = {}
+        self._local_cache: Dict[str, List[PromptVersion]] = {}
 
     def create_prompt(
             self,
-            name: str,
-            template: str,
-            variables: List[str],
+            name_or_prompt: Union[str, PromptVersion],
+            template: Optional[str] = None,
+            variables: Optional[List[str]] = None,
             model_config: Optional[Dict[str, Any]] = None,
             tags: Optional[List[str]] = None,
             description: str = "",
             created_by: str = "system"
         ) -> PromptVersion:
+        # Handle both PromptVersion object and individual parameters
+        if isinstance(name_or_prompt, PromptVersion):
+            # If PromptVersion object is passed, use its attributes
+            prompt_obj = name_or_prompt
+            name = prompt_obj.name
+            template = prompt_obj.template
+            variables = prompt_obj.variables
+            model_config = prompt_obj.model_config
+            tags = prompt_obj.tags
+            description = prompt_obj.description
+            created_by = prompt_obj.created_by or "system"
+        else:
+            # If individual parameters are passed
+            name = name_or_prompt
+            if template is None:
+                raise ValueError("template is required when creating prompt with individual parameters")
+            if variables is None:
+                # Try to extract variables from template
+                variables = list(set(
+                    re.findall(r'\{(\w+)\}', template) + 
+                    re.findall(r'\$\{(\w+)\}', template)
+                ))
         version = 1
 
         if self.enable_langfuse:
@@ -198,6 +222,165 @@ class PromptRegistry:
             except Exception as e:
                 logger.warning(f"Failed to list prompts from Langfuse: {e}")
         return list(names)
+    
+    def list_prompt_versions(self, name: str) -> List[Dict[str, Any]]:
+        """List all versions of a specific prompt."""
+        versions = []
+        
+        # Get from local cache
+        if name in self._local_cache:
+            versions.extend([
+                {"version": pv.version, "status": pv.status, "created_at": pv.created_at}
+                for pv in self._local_cache[name]
+            ])
+        
+        # Get from Langfuse if enabled
+        if self.enable_langfuse:
+            try:
+                langfuse_versions = self.langfuse.list_prompt_versions(name)
+                for lv in langfuse_versions:
+                    versions.append({
+                        "version": str(lv.get("version", "1")),
+                        "status": "active",
+                        "created_at": lv.get("created_at", "")
+                    })
+            except Exception as e:
+                logger.warning(f"Failed to list prompt versions from Langfuse: {e}")
+        
+        return versions
+    
+    def render_prompt(
+        self,
+        name: str,
+        variables: Dict[str, Any],
+        version: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Render a prompt template with the provided variables.
+        
+        Args:
+            name: Name of the prompt
+            variables: Dictionary of variables to substitute in the template
+            version: Optional specific version (defaults to latest)
+            
+        Returns:
+            Rendered prompt string or None if prompt not found
+        """
+        prompt = self.get_prompt(name, version)
+        if not prompt:
+            logger.warning(f"Prompt '{name}' not found for rendering")
+            return None
+        
+        try:
+            # Simple template substitution using string format
+            # Support both {variable} and ${variable} formats
+            rendered = prompt.template
+            
+            for var_name, var_value in variables.items():
+                # Replace {variable} format
+                rendered = rendered.replace(f"{{{var_name}}}", str(var_value))
+                # Replace ${variable} format
+                rendered = rendered.replace(f"${{{var_name}}}", str(var_value))
+            
+            # Check if any required variables are missing
+            missing_vars = []
+            for var in prompt.variables:
+                if var not in variables:
+                    missing_vars.append(var)
+            
+            if missing_vars:
+                logger.warning(
+                    f"Prompt '{name}' rendered with missing variables: {missing_vars}"
+                )
+            
+            return rendered
+            
+        except Exception as e:
+            logger.error(f"Failed to render prompt '{name}': {e}")
+            return None
+    
+    def _langfuse_to_prompt_version(self, langfuse_prompt: Any) -> PromptVersion:
+        """
+        Convert a Langfuse prompt object to a PromptVersion.
+        
+        Args:
+            langfuse_prompt: Langfuse prompt object
+            
+        Returns:
+            PromptVersion instance
+        """
+        try:
+            # Langfuse prompt object structure
+            # Extract data from the Langfuse prompt object
+            if hasattr(langfuse_prompt, 'name'):
+                name = langfuse_prompt.name
+            else:
+                name = langfuse_prompt.get('name', 'unknown')
+            
+            if hasattr(langfuse_prompt, 'version'):
+                version = str(langfuse_prompt.version)
+            else:
+                version = str(langfuse_prompt.get('version', '1'))
+            
+            if hasattr(langfuse_prompt, 'prompt'):
+                template = langfuse_prompt.prompt
+            else:
+                template = langfuse_prompt.get('prompt', '')
+            
+            if hasattr(langfuse_prompt, 'config'):
+                model_config = langfuse_prompt.config or {}
+            else:
+                model_config = langfuse_prompt.get('config', {})
+            
+            if hasattr(langfuse_prompt, 'labels'):
+                tags = langfuse_prompt.labels or []
+            else:
+                tags = langfuse_prompt.get('labels', [])
+            
+            # Extract variables from template
+            # Look for {variable} and ${variable} patterns
+            variables = list(set(
+                re.findall(r'\{(\w+)\}', template) + 
+                re.findall(r'\$\{(\w+)\}', template)
+            ))
+            
+            # Get metadata
+            created_at = ""
+            created_by = "langfuse"
+            
+            if hasattr(langfuse_prompt, 'created_at'):
+                created_at = str(langfuse_prompt.created_at)
+            elif isinstance(langfuse_prompt, dict) and 'created_at' in langfuse_prompt:
+                created_at = str(langfuse_prompt['created_at'])
+            
+            if hasattr(langfuse_prompt, 'created_by'):
+                created_by = langfuse_prompt.created_by
+            elif isinstance(langfuse_prompt, dict) and 'created_by' in langfuse_prompt:
+                created_by = langfuse_prompt['created_by']
+            
+            return PromptVersion(
+                name=name,
+                version=version,
+                template=template,
+                variables=variables,
+                model_config=model_config,
+                tags=tags,
+                description="",
+                created_at=created_at,
+                created_by=created_by,
+                status="active"
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to convert Langfuse prompt to PromptVersion: {e}")
+            # Return a minimal PromptVersion as fallback
+            return PromptVersion(
+                name="unknown",
+                version="1",
+                template="",
+                variables=[],
+                status="active"
+            )
 
     def import_prompt(self, file_path: str, created_by: str = "import") -> PromptVersion:
         """Import a prompt from a JSON file."""
@@ -231,3 +414,49 @@ class PromptRegistry:
             json.dump(prompt.to_dict(), f, indent=2)
         logger.info(f"Prompt {name}@{prompt.version} exported to {export_path}")
         return export_path
+    
+    def archive_prompt(
+            self,
+            name: str,
+            version: Optional[int] = None,
+        ):
+        if name in self._local_cache:
+            for prompt_version in self._local_cache[name]:
+                if version is None or prompt_version.version == version:
+                    prompt_version.status = "archived"
+                    self.update_prompt(
+                        name=prompt_version.name,
+                        version=prompt_version.version,
+                        status="archived",
+                        updated_by="system"
+                    )
+                    logger.info(f"Prompt {name}@{prompt_version.version} archived")
+
+    def render_prompt(
+            self,
+            name: str,
+            variables: Dict[str, Any],
+            version: Optional[int] = None,
+    ) -> str:
+        prompt = self.get_prompt(name, version)
+        if not prompt:
+            raise ValueError(f"Prompt '{name}' version {version} not found for rendering.")
+        
+        template = prompt.template
+        for var_name, var_value in variables.items():
+            placeholder = "{" + var_name + "}"
+            template = template.replace(placeholder, str(var_value))
+
+    def _langfuse_to_prompt_version(self, langfuse_prompt: Dict[str, Any]) -> PromptVersion:
+        return PromptVersion(
+            name=langfuse_prompt.get("name"),
+            version=str(langfuse_prompt.get("version")),
+            template=langfuse_prompt.get("prompt"),
+            variables=langfuse_prompt.get("config", {}).get("variables", []),
+            model_config=langfuse_prompt.get("config", {}),
+            tags=langfuse_prompt.get("labels", []),
+            description=langfuse_prompt.get("description", ""),
+            created_at=langfuse_prompt.get("created_at", ""),
+            created_by=langfuse_prompt.get("created_by", ""),
+            status=langfuse_prompt.get("status", "active")
+        )
